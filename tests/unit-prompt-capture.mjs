@@ -114,6 +114,42 @@ describe("PromptCaptures", () => {
 		assert.equal(captures.resolveOrDerive(undefined), undefined);
 	});
 
+	it("re-keys a prompt pi rebuilt around unchanged instructions", () => {
+		const captures = new PromptCaptures();
+		const boilerplate = `${PI_HARNESS}\n${"pi tool and safety prose. ".repeat(40)}`;
+		const assembled = `${boilerplate}\n\n# Tools\nread, bash\n\n${"custom policy the user wrote. ".repeat(20)}`;
+		captures.record(assembled, capture({
+			custom: "custom policy the user wrote",
+			contextFiles: [{ path: "/AGENTS.md", content: "parent rules" }],
+			skills: [skill("deploy")],
+		}));
+
+		// A tool registered after the turn began, or an MCP server that finished
+		// connecting: pi's own section moves, the instructions around it do not. Pi also
+		// reflows skill text and drops resources it stops offering, so this must not
+		// depend on the portable parts surviving verbatim.
+		const rebuilt = assembled.replace("read, bash", "read, bash, late_tool");
+		const resolved = captures.resolveOrDerive(rebuilt);
+
+		assert.equal(resolved.contextFiles[0].content, "parent rules");
+		assert.equal(resolved.custom, "custom policy the user wrote");
+		assert.deepEqual(resolved.skills.map((s) => s.name), ["deploy"]);
+		// Re-keyed, so the next turn on the rebuilt prompt takes the exact path.
+		assert.ok(captures.resolve(rebuilt));
+	});
+
+	it("still throws when another agent's instructions replace the ones recorded", () => {
+		const captures = new PromptCaptures();
+		const boilerplate = `${PI_HARNESS}\n${"pi tool and safety prose. ".repeat(40)}`;
+		const assembled = `${boilerplate}\n\n# Tools\nread, bash\n\n${"custom policy the user wrote. ".repeat(20)}`;
+		captures.record(assembled, capture({ custom: "custom policy the user wrote" }));
+
+		assert.throws(
+			() => captures.resolveOrDerive(`${boilerplate}\n\n# Tools\nread, bash\n\n${"some other agent's policy. ".repeat(20)}`),
+			/no capture for this .* system prompt/,
+		);
+	});
+
 	it("reports the closest known capture when a prompt matches nothing", () => {
 		const diagnostics = [];
 		const captures = new PromptCaptures(64, (d) => diagnostics.push(d));

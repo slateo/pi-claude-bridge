@@ -46,6 +46,27 @@ export type PromptCaptureDiagnostic = {
 	matches: { key: string; firstDivergent: number }[];
 };
 
+/** How much of a prompt an edit must leave untouched to read as pi rebuilding one of
+ *  its own sections rather than a different agent's prompt arriving. A late-registered
+ *  tool or a freshly connected MCP server moves a few hundred characters of a prompt in
+ *  the tens of thousands. */
+const REBUILD_MIN_UNCHANGED = 0.9;
+
+/** Share of the longer prompt covered by the common prefix and suffix. */
+function unchangedRatio(a: string, b: string): number {
+	const longest = Math.max(a.length, b.length);
+	if (longest === 0) return 1;
+	const limit = Math.min(a.length, b.length);
+
+	let prefix = 0;
+	while (prefix < limit && a.charCodeAt(prefix) === b.charCodeAt(prefix)) prefix++;
+
+	let suffix = 0;
+	while (suffix < limit - prefix && a.charCodeAt(a.length - 1 - suffix) === b.charCodeAt(b.length - 1 - suffix)) suffix++;
+
+	return (prefix + suffix) / longest;
+}
+
 export class PromptCaptures {
 	private readonly captures = new Map<string, PromptCapture>();
 	/** Invoked with everything that would otherwise be lost when resolution throws,
@@ -128,11 +149,19 @@ export class PromptCaptures {
 	 * dropping it would be exactly the silent instruction loss this exists to
 	 * prevent. The descendant is not retained — its key is not ours to own.
 	 *
-	 * Throws when a prompt can be accounted for by neither route. Returning an empty
-	 * capture instead would hand Claude Code a turn with none of the user's context
-	 * files, skills, custom prompt or append text, and say so only in a debug line —
-	 * silently discarding policy the user wrote down. A failed turn is recoverable;
-	 * a turn that quietly ignored its instructions is not.
+	 * A prompt pi rebuilt for an agent we already captured — a tool registered after
+	 * the turn began, an MCP server that finished connecting — is neither, because the
+	 * rebuild edits pi's own sections while every portable part stays byte-identical.
+	 * Those turns are re-keyed onto the capture whose portable text they still carry,
+	 * which matters most for turns an extension injects (a fired background monitor,
+	 * say): they never fire `before_agent_start`, so nothing re-records them and the
+	 * first one after any rebuild would otherwise fail for the rest of the session.
+	 *
+	 * Throws when a prompt can be accounted for by none of those routes. Returning an
+	 * empty capture instead would hand Claude Code a turn with none of the user's
+	 * context files, skills, custom prompt or append text, and say so only in a debug
+	 * line — silently discarding policy the user wrote down. A failed turn is
+	 * recoverable; a turn that quietly ignored its instructions is not.
 	 */
 	resolveOrDerive(systemPrompt?: string): PromptCapture | undefined {
 		if (!systemPrompt) return undefined;
@@ -156,6 +185,11 @@ export class PromptCaptures {
 		if (embedded.length === 0) {
 			const matches = this.closestKnown(systemPrompt);
 			this.onDiagnose({ systemPrompt, matches });
+			const rebased = this.rebasable(systemPrompt);
+			if (rebased) {
+				this.touch(systemPrompt, rebased);
+				return rebased;
+			}
 			throw new Error(
 				`prompt-capture: no capture for this ${systemPrompt.length}-char system prompt, and it embeds none of the ${this.captures.size} known. `
 				+ `Closest known match diverges at offset ${matches[0]?.firstDivergent ?? "?"} (${matches.length ? matches[0].key.length : 0}-char key). `
@@ -174,6 +208,20 @@ export class PromptCaptures {
 
 	get size(): number {
 		return this.captures.size;
+	}
+
+	/** The most recent capture this prompt is a rebuild of, recognised by how little of
+	 *  it moved.
+	 *
+	 *  A rebuild rewrites one of pi's own sections and leaves the rest byte-identical, so
+	 *  an unchanged prefix and suffix account for nearly the whole prompt. Two different
+	 *  agents differ in their own instructions instead — long, and between pi's
+	 *  boilerplate — so they share far less. Comparing the portable parts as text looks
+	 *  stricter but is not: pi reflows skill descriptions for the model and drops
+	 *  resources it no longer offers, so real rebuilds fail a verbatim comparison. */
+	private rebasable(systemPrompt: string): PromptCapture | undefined {
+		const byRecency = [...this.captures.values()].reverse();
+		return byRecency.find((capture) => unchangedRatio(capture.assembledPrompt, systemPrompt) >= REBUILD_MIN_UNCHANGED);
 	}
 
 	/** Longest shared-prefix matches, best first, for the throw diagnostic. */
