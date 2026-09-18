@@ -1,0 +1,28 @@
+[Unit]
+Description=Claude Code Harness OpenAI Adapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/will/.local/src/pi-claude-bridge
+EnvironmentFile=/home/will/.config/ai-router/claude-bridge.env
+Environment=CLAUDE_BRIDGE_HOST=127.0.0.1
+Environment=CLAUDE_BRIDGE_PORT=8318
+Environment=CLAUDE_BRIDGE_PI_BIN=/home/will/.local/share/mise/installs/pi/latest/pi/pi
+Environment=CLAUDE_BRIDGE_EXTENSION_DIR=/home/will/.local/src/pi-claude-bridge
+Environment=CLAUDE_BRIDGE_CWD=/home/will
+ExecStart=/usr/bin/node --import tsx ./src/openai-server.ts
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/will/.claude /home/will/.pi /home/will/.config/ai-router
+MemoryMax=6G
+TasksMax=512
+
+[Install]
+WantedBy=default.target
