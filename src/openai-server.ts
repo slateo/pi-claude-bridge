@@ -1,16 +1,18 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { MODEL_IDS_IN_ORDER } from "./models.js";
-
-type ChatMessage = { role?: string; content?: unknown };
-type ChatRequest = { model?: string; messages?: ChatMessage[]; stream?: boolean };
-type PiRequest = { system: string; prompt: string; sessionJsonl: string; cwd: string };
-type PiInvocation = { args: string[]; stdin: string; tempDir: string; cleanup: () => Promise<void> };
+import { configureStandaloneBridge, streamClaudeAgentSdk } from "./index.js";
+import {
+	chatRequestToRelay,
+	ContinuationRegistry,
+	rawSystemPrompt,
+	type ChatMessage,
+	type ChatRequest,
+	type ContinuationLease,
+} from "./openai-relay.js";
 type Usage = { input?: number; output?: number; cacheRead?: number; cacheWrite?: number };
 type HarnessUsageWindow = { utilization: number; resets_at: string | null };
 type HarnessUsagePayload = {
@@ -28,10 +30,8 @@ type HarnessUsagePayload = {
 const DEFAULT_MAX_BODY = 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_HEARTBEAT_MS = 15_000;
-const DEFAULT_TERMINATION_GRACE_MS = 5_000;
 const PI_SYSTEM_PROMPT_START = "You are an expert coding assistant operating inside pi, a coding agent harness.";
 const PI_SYSTEM_PROMPT_END = "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)";
-const extensionDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const modelSet = new Set(MODEL_IDS_IN_ORDER);
 
 const USAGE_LINES = [
@@ -131,90 +131,6 @@ function textContent(content: unknown): string {
 		.join("\n");
 }
 
-export function messagesToPrompt(messages: ChatMessage[]): { prompt: string; system: string } {
-	const system: string[] = [];
-	const turns: string[] = [];
-	for (const message of messages) {
-		const role = typeof message.role === "string" ? message.role : "user";
-		const text = textContent(message.content).trim();
-		if (!text) continue;
-		if (role === "system" || role === "developer") system.push(text);
-		else turns.push(`[${role}]\n${text}`);
-	}
-	return {
-		system: system.join("\n\n"),
-		prompt: `${turns.join("\n\n")}\n\nRespond to the final user message.`.trim(),
-	};
-}
-
-function zeroUsage() {
-	return {
-		input: 0,
-		output: 0,
-		cacheRead: 0,
-		cacheWrite: 0,
-		totalTokens: 0,
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-}
-
-/**
- * Convert prior text turns into a temporary Pi session. The final text turn is
- * delivered over stdin as the live prompt, so neither history nor prompt size
- * is constrained by Linux's per-argument limit.
- */
-export function messagesToPiRequest(messages: ChatMessage[], model: string, cwd: string): PiRequest {
-	const system: string[] = [];
-	const turns: Array<{ role: string; text: string }> = [];
-	for (const message of messages) {
-		const role = typeof message.role === "string" ? message.role : "user";
-		const text = textContent(message.content).trim();
-		if (!text) continue;
-		if (role === "system" || role === "developer") system.push(text);
-		else turns.push({ role, text });
-	}
-	const current = turns.pop();
-	if (!current) return { system: system.join("\n\n"), prompt: "", sessionJsonl: "", cwd };
-
-	const now = Date.now();
-	const timestamp = new Date(now).toISOString();
-	const sessionId = randomUUID();
-	const entries: unknown[] = [{ type: "session", version: 3, id: sessionId, timestamp, cwd }];
-	let parentId: string | null = null;
-	for (const [index, turn] of turns.entries()) {
-		const id = randomUUID().slice(0, 8);
-		const messageTimestamp = now - (turns.length - index) * 1000;
-		let message: unknown;
-		if (turn.role === "assistant") {
-			message = {
-				role: "assistant",
-				content: [{ type: "text", text: turn.text }],
-				api: "openai-completions",
-				provider: "ai-router",
-				model,
-				usage: zeroUsage(),
-				stopReason: "stop",
-				timestamp: messageTimestamp,
-			};
-		} else {
-			message = {
-				role: "user",
-				content: [{ type: "text", text: turn.role === "user" ? turn.text : `[${turn.role}]\n${turn.text}` }],
-				timestamp: messageTimestamp,
-			};
-		}
-		entries.push({ type: "message", id, parentId, timestamp: new Date(messageTimestamp).toISOString(), message });
-		parentId = id;
-	}
-
-	return {
-		system: system.join("\n\n"),
-		prompt: current.role === "user" ? current.text : `[${current.role}]\n${current.text}\n\nRespond to this final message.`,
-		sessionJsonl: `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-		cwd,
-	};
-}
-
 /** Preserve the caller Pi session's working directory for host-local tool use. */
 export function piClientWorkingDirectory(messages: ChatMessage[], fallback: string): string {
 	const system = messages
@@ -242,27 +158,6 @@ export function projectPiClientSystemPrompt(system: string): string {
 	return portable;
 }
 
-export function parsePiLine(line: string): { delta?: string; thinking?: string; final?: string; usage?: Usage; error?: string } {
-	let event: any;
-	try { event = JSON.parse(line); } catch { return {}; }
-	if (event?.type === "message_update" && event?.assistantMessageEvent?.type === "text_delta") {
-		return { delta: event.assistantMessageEvent.delta, usage: event.usage };
-	}
-	if (event?.type === "message_update" && event?.assistantMessageEvent?.type === "thinking_delta") {
-		return { thinking: event.assistantMessageEvent.delta, usage: event.usage };
-	}
-	if (event?.type === "message_end" && event?.message?.role === "assistant") {
-		const final = Array.isArray(event.message.content)
-			? event.message.content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("")
-			: "";
-		return { final, usage: event.message.usage };
-	}
-	if (event?.type === "agent_end" && event?.willRetry === false && event?.error) {
-		return { error: String(event.error) };
-	}
-	return {};
-}
-
 function json(res: ServerResponse, status: number, value: unknown): void {
 	const body = JSON.stringify(value);
 	res.writeHead(status, { "content-type": "application/json", "content-length": Buffer.byteLength(body) });
@@ -283,71 +178,6 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<unknown
 		chunks.push(buffer);
 	}
 	return JSON.parse(Buffer.concat(chunks).toString("utf8"));
-}
-
-export async function preparePiInvocation(model: string, request: PiRequest): Promise<PiInvocation> {
-	const tempDir = await mkdtemp(join(tmpdir(), "claude-bridge-openai-"));
-	await chmod(tempDir, 0o700);
-	const sessionPath = join(tempDir, "session.jsonl");
-	const systemPath = join(tempDir, "system.txt");
-	try {
-		await writeFile(sessionPath, request.sessionJsonl, { encoding: "utf8", mode: 0o600 });
-		const args = ["--session", sessionPath, "-ne", "-e", process.env.CLAUDE_BRIDGE_EXTENSION_DIR || extensionDir,
-			"--model", `claude-bridge/${model}`, "--mode", "json"];
-		if (request.system) {
-			await writeFile(systemPath, request.system, { encoding: "utf8", mode: 0o600 });
-			args.push("--append-system-prompt", systemPath);
-		}
-		args.push("-p");
-		return {
-			args,
-			stdin: request.prompt,
-			tempDir,
-			cleanup: () => rm(tempDir, { recursive: true, force: true }),
-		};
-	} catch (error) {
-		await rm(tempDir, { recursive: true, force: true });
-		throw error;
-	}
-}
-
-async function startPi(model: string, request: PiRequest): Promise<{ child: ChildProcessWithoutNullStreams; cleanup: () => Promise<void> }> {
-	const piBin = process.env.CLAUDE_BRIDGE_PI_BIN || "pi";
-	const invocation = await preparePiInvocation(model, request);
-	const child = spawn(piBin, invocation.args, {
-		cwd: request.cwd,
-		detached: process.platform !== "win32",
-		env: { ...process.env, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" },
-		stdio: ["pipe", "pipe", "pipe"],
-	});
-	child.stdin.on("error", () => {});
-	child.stdin.end(invocation.stdin);
-	return { child, cleanup: invocation.cleanup };
-}
-
-function signalChildTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals): void {
-	if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-	if (process.platform !== "win32") {
-		try {
-			process.kill(-child.pid, signal);
-			return;
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
-		}
-	}
-	try {
-		child.kill(signal);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-	}
-}
-
-function terminateChildTree(child: ChildProcessWithoutNullStreams, graceMs: number): NodeJS.Timeout | undefined {
-	signalChildTree(child, "SIGTERM");
-	if (child.exitCode !== null || child.signalCode !== null) return undefined;
-	const forceKill = setTimeout(() => signalChildTree(child, "SIGKILL"), graceMs);
-	forceKill.unref();
-	return forceKill;
 }
 
 async function runClaude(args: string[], timeoutMs = 30_000): Promise<string> {
@@ -417,7 +247,8 @@ function completionChunk(
 	created: number,
 	model: string,
 	delta: Record<string, unknown>,
-	finishReason: "stop" | null = null,
+	finishReason: "stop" | "length" | "tool_calls" | null = null,
+	usage?: ReturnType<typeof usageShape>,
 ): string {
 	return `data: ${JSON.stringify({
 		id,
@@ -425,6 +256,7 @@ function completionChunk(
 		created,
 		model,
 		choices: [{ index: 0, delta, finish_reason: finishReason }],
+		...(usage ? { usage } : {}),
 	})}\n\n`;
 }
 
@@ -434,40 +266,37 @@ function writeStreamChunk(res: ServerResponse, chunk: string): boolean {
 	return true;
 }
 
-async function handleChat(res: ServerResponse, body: ChatRequest): Promise<void> {
-	const model = String(body.model || "");
-	if (!modelSet.has(model)) return json(res, 400, { error: { message: `unsupported model: ${model}` } });
+async function handleChat(
+	res: ServerResponse,
+	body: ChatRequest,
+	continuations: ContinuationRegistry,
+	streamFn: typeof streamClaudeAgentSdk,
+): Promise<void> {
+	const modelId = String(body.model || "");
+	if (!modelSet.has(modelId)) return json(res, 400, { error: { message: `unsupported model: ${modelId}` } });
 	if (!Array.isArray(body.messages) || body.messages.length === 0) {
 		return json(res, 400, { error: { message: "messages must be a non-empty array" } });
 	}
-	const cwd = piClientWorkingDirectory(body.messages, process.env.CLAUDE_BRIDGE_CWD || "/tmp");
-	const request = messagesToPiRequest(body.messages, model, cwd);
-	request.system = projectPiClientSystemPrompt(request.system);
-	if (!request.prompt) return json(res, 400, { error: { message: "messages contain no text" } });
 
+	const system = projectPiClientSystemPrompt(rawSystemPrompt(body));
+	const relay = chatRequestToRelay(body, system);
+	const lease: ContinuationLease = relay.resultIds.length > 0
+		? continuations.resume(modelId, relay.resultIds)
+		: continuations.create(modelId);
 	const id = `chatcmpl-${randomUUID()}`;
 	const created = Math.floor(Date.now() / 1000);
-	const { child, cleanup } = await startPi(model, request);
 	const timeoutMs = Number(process.env.CLAUDE_BRIDGE_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
-	const terminationGraceMs = Number(process.env.CLAUDE_BRIDGE_TERMINATION_GRACE_MS || DEFAULT_TERMINATION_GRACE_MS);
-	let terminationReason: string | undefined;
-	let forceKill: NodeJS.Timeout | undefined;
-	const terminate = (reason: string) => {
-		if (terminationReason !== undefined) return;
-		terminationReason = reason;
-		forceKill = terminateChildTree(child, terminationGraceMs);
-	};
-	const timeout = setTimeout(() => terminate(`Claude bridge timed out after ${timeoutMs}ms`), timeoutMs);
+	let timedOut = false;
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		continuations.cancel(lease, `Claude relay timed out after ${timeoutMs}ms`);
+	}, timeoutMs);
 	timeout.unref();
-	let heartbeat: NodeJS.Timeout | undefined;
-	let stderr = "";
-	let stdoutBuffer = "";
-	let final = "";
-	let streamed = false;
-	let latestUsage: Usage | undefined;
 
+	let heartbeat: NodeJS.Timeout | undefined;
+	let responseEnded = false;
 	const onClientClose = () => {
-		if (!res.writableEnded) terminate("Claude bridge client disconnected");
+		if (!responseEnded && !res.writableEnded) continuations.cancel(lease, "Claude relay client disconnected");
 	};
 	res.once("close", onClientClose);
 
@@ -478,79 +307,132 @@ async function handleChat(res: ServerResponse, body: ChatRequest): Promise<void>
 			connection: "keep-alive",
 			"x-accel-buffering": "no",
 		});
-		writeStreamChunk(res, completionChunk(id, created, model, { role: "assistant" }));
+		writeStreamChunk(res, completionChunk(id, created, modelId, { role: "assistant" }));
 		const heartbeatMs = Number(process.env.CLAUDE_BRIDGE_HEARTBEAT_MS || DEFAULT_HEARTBEAT_MS);
-		heartbeat = setInterval(() => {
-			// Use an empty, valid OpenAI chunk rather than an SSE comment because
-			// compatibility proxies may parse and re-encode the stream.
-			writeStreamChunk(res, completionChunk(id, created, model, {}));
-		}, heartbeatMs);
+		heartbeat = setInterval(() => writeStreamChunk(res, completionChunk(id, created, modelId, {})), heartbeatMs);
 		heartbeat.unref();
 	}
 
-	child.stderr.on("data", (chunk) => { stderr = (stderr + chunk.toString()).slice(-8192); });
-	child.stdout.on("data", (chunk) => {
-		stdoutBuffer += chunk.toString();
-		for (;;) {
-			const newline = stdoutBuffer.indexOf("\n");
-			if (newline < 0) break;
-			const line = stdoutBuffer.slice(0, newline);
-			stdoutBuffer = stdoutBuffer.slice(newline + 1);
-			const parsed = parsePiLine(line);
-			if (parsed.usage) latestUsage = parsed.usage;
-			if (parsed.final !== undefined) final = parsed.final;
-			if (body.stream && parsed.thinking) {
-				writeStreamChunk(res, completionChunk(id, created, model, { reasoning_content: parsed.thinking }));
-			}
-			if (body.stream && parsed.delta) {
-				streamed = true;
-				writeStreamChunk(res, completionChunk(id, created, model, { content: parsed.delta }));
+	let finalMessage: import("@earendil-works/pi-ai").AssistantMessage | undefined;
+	let terminalError: string | undefined;
+	try {
+		const stream = streamFn(relay.model, relay.context, {
+			reasoning: relay.reasoning,
+			signal: lease.controller.signal,
+			cwd: piClientWorkingDirectory(body.messages, process.env.CLAUDE_BRIDGE_CWD || "/tmp"),
+			metadata: { claudeBridgeIsolatedSession: true },
+		} as import("@earendil-works/pi-ai").SimpleStreamOptions & { cwd: string });
+
+		for await (const event of stream) {
+			if (event.type === "thinking_delta" && body.stream) {
+				writeStreamChunk(res, completionChunk(id, created, modelId, { reasoning_content: event.delta }));
+			} else if (event.type === "text_delta" && body.stream) {
+				writeStreamChunk(res, completionChunk(id, created, modelId, { content: event.delta }));
+			} else if (event.type === "toolcall_end" && body.stream) {
+				const call = event.toolCall;
+				writeStreamChunk(res, completionChunk(id, created, modelId, {
+					tool_calls: [{
+						index: event.partial.content.filter((block) => block.type === "toolCall").findIndex((block) => block.id === call.id),
+						id: call.id,
+						type: "function",
+						function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+					}],
+				}));
+			} else if (event.type === "done") {
+				finalMessage = event.message;
+			} else if (event.type === "error") {
+				finalMessage = event.error;
+				terminalError = event.error.errorMessage || `Claude relay ${event.reason}`;
 			}
 		}
-	});
-
-	let exitCode: number | null;
-	try {
-		exitCode = await new Promise<number | null>((resolveExit, reject) => {
-			child.once("error", reject);
-			child.once("close", resolveExit);
-		});
+	} catch (error) {
+		terminalError = timedOut
+			? `Claude relay timed out after ${timeoutMs}ms`
+			: error instanceof Error ? error.message : String(error);
 	} finally {
 		clearTimeout(timeout);
 		if (heartbeat) clearInterval(heartbeat);
-		if (forceKill) clearTimeout(forceKill);
 		res.off("close", onClientClose);
-		await cleanup();
 	}
-	if (res.destroyed) return;
-	if (exitCode !== 0 || !final) {
-		const message = terminationReason || stderr.trim().split("\n").slice(-1)[0] || `Claude bridge exited with code ${exitCode}`;
+
+	if (res.destroyed) {
+		continuations.cancel(lease, terminalError || "Claude relay response destroyed");
+		return;
+	}
+	if (terminalError || !finalMessage) {
+		continuations.cancel(lease, terminalError || "Claude relay ended without a final message");
+		const message = terminalError || "Claude relay ended without a final message";
 		if (body.stream) {
 			writeStreamChunk(res, `data: ${JSON.stringify({ error: { message } })}\n\n`);
+			responseEnded = true;
 			res.end("data: [DONE]\n\n");
 			return;
 		}
+		responseEnded = true;
 		return json(res, 502, { error: { message } });
 	}
+
+	const toolCalls = finalMessage.content.filter((block) => block.type === "toolCall");
+	const finishReason = finalMessage.stopReason === "toolUse"
+		? "tool_calls"
+		: finalMessage.stopReason === "length" ? "length" : "stop";
+	if (finishReason === "tool_calls") {
+		if (toolCalls.length === 0) {
+			continuations.cancel(lease, "Claude relay stopped for tools without tool calls");
+			throw new Error("Claude relay stopped for tools without tool calls");
+		}
+		continuations.bind(lease, toolCalls.map((call) => call.id));
+	} else {
+		continuations.finish(lease);
+	}
+
+	const usage = usageShape(finalMessage.usage);
 	if (body.stream) {
-		if (!streamed) writeStreamChunk(res, completionChunk(id, created, model, { content: final }));
-		writeStreamChunk(res, completionChunk(id, created, model, {}, "stop"));
+		writeStreamChunk(res, completionChunk(id, created, modelId, {}, finishReason, usage));
+		responseEnded = true;
 		res.end("data: [DONE]\n\n");
 		return;
 	}
+
+	const text = finalMessage.content
+		.filter((block) => block.type === "text")
+		.map((block) => block.text)
+		.join("");
+	responseEnded = true;
 	json(res, 200, {
-		id, object: "chat.completion", created, model,
-		choices: [{ index: 0, message: { role: "assistant", content: final }, finish_reason: "stop" }],
-		usage: usageShape(latestUsage),
+		id,
+		object: "chat.completion",
+		created,
+		model: modelId,
+		choices: [{
+			index: 0,
+			message: {
+				role: "assistant",
+				content: text || null,
+				...(toolCalls.length > 0 ? {
+					tool_calls: toolCalls.map((call) => ({
+						id: call.id,
+						type: "function",
+						function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) },
+					})),
+				} : {}),
+			},
+			finish_reason: finishReason,
+		}],
+		usage,
 	});
 }
 
-export function startServer() {
+export function startServer(options: { streamFn?: typeof streamClaudeAgentSdk } = {}) {
 	const apiKey = process.env.CLAUDE_BRIDGE_API_KEY;
 	if (!apiKey) throw new Error("CLAUDE_BRIDGE_API_KEY is required");
 	const host = process.env.CLAUDE_BRIDGE_HOST || "127.0.0.1";
 	const port = Number(process.env.CLAUDE_BRIDGE_PORT || 8318);
 	const maxBody = Number(process.env.CLAUDE_BRIDGE_MAX_BODY_BYTES || DEFAULT_MAX_BODY);
+	const continuationTtlMs = Number(process.env.CLAUDE_BRIDGE_CONTINUATION_TTL_MS || DEFAULT_TIMEOUT_MS);
+	const streamFn = options.streamFn ?? streamClaudeAgentSdk;
+	configureStandaloneBridge(process.env.CLAUDE_BRIDGE_CWD || "/tmp");
+	const continuations = new ContinuationRegistry(continuationTtlMs);
 	const server = createServer(async (req, res) => {
 		try {
 			if (!authorized(req, apiKey)) return json(res, 401, { error: { message: "unauthorized" } });
@@ -563,11 +445,15 @@ export function startServer() {
 				return json(res, 200, await getHarnessUsage());
 			}
 			if (req.method === "POST" && path === "/v1/chat/completions") {
-				return await handleChat(res, await readBody(req, maxBody) as ChatRequest);
+				return await handleChat(res, await readBody(req, maxBody) as ChatRequest, continuations, streamFn);
 			}
 			return json(res, 404, { error: { message: "not found" } });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			if (res.headersSent) {
+				if (!res.writableEnded) res.end(`data: ${JSON.stringify({ error: { message } })}\n\ndata: [DONE]\n\n`);
+				return;
+			}
 			return json(res, message.includes("body exceeds") ? 413 : 400, { error: { message } });
 		}
 	});

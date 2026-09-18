@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { once } from "node:events";
 import { request as httpRequest } from "node:http";
 import { join } from "node:path";
@@ -16,50 +16,38 @@ const waitFor = async (check, timeoutMs = 2_000) => {
 	throw new Error("timed out waiting for condition");
 };
 
-test("streaming requests emit heartbeats and reap Pi when the client disconnects", async () => {
+test("streaming requests emit heartbeats and cancel the Claude query when the client disconnects", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "openai-bridge-lifecycle-"));
-	const fakePi = join(directory, "fake-pi.mjs");
-	const ready = join(directory, "ready");
-	const terminated = join(directory, "terminated");
-	await writeFile(fakePi, `#!/usr/bin/env node
-import { writeFileSync } from "node:fs";
-process.on("SIGTERM", () => {
-  writeFileSync(process.env.FAKE_PI_TERMINATED, "SIGTERM");
-  process.exit(0);
-});
-writeFileSync(process.env.FAKE_PI_READY, "ready");
-process.stdin.resume();
-setInterval(() => {}, 1000);
-`);
-	await chmod(fakePi, 0o700);
+	let aborted = false;
+	const streamFn = (_model, _context, options) => ({
+		async *[Symbol.asyncIterator]() {
+			await new Promise((resolve) => {
+				if (options.signal.aborted) return resolve();
+				options.signal.addEventListener("abort", resolve, { once: true });
+			});
+			aborted = true;
+		},
+	});
 
 	const keys = [
 		"CLAUDE_BRIDGE_API_KEY",
 		"CLAUDE_BRIDGE_HOST",
 		"CLAUDE_BRIDGE_PORT",
-		"CLAUDE_BRIDGE_PI_BIN",
 		"CLAUDE_BRIDGE_CWD",
 		"CLAUDE_BRIDGE_HEARTBEAT_MS",
 		"CLAUDE_BRIDGE_TIMEOUT_MS",
-		"CLAUDE_BRIDGE_TERMINATION_GRACE_MS",
-		"FAKE_PI_READY",
-		"FAKE_PI_TERMINATED",
 	];
 	const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
 	Object.assign(process.env, {
 		CLAUDE_BRIDGE_API_KEY: "test-key",
 		CLAUDE_BRIDGE_HOST: "127.0.0.1",
 		CLAUDE_BRIDGE_PORT: "0",
-		CLAUDE_BRIDGE_PI_BIN: fakePi,
 		CLAUDE_BRIDGE_CWD: directory,
 		CLAUDE_BRIDGE_HEARTBEAT_MS: "20",
 		CLAUDE_BRIDGE_TIMEOUT_MS: "5000",
-		CLAUDE_BRIDGE_TERMINATION_GRACE_MS: "100",
-		FAKE_PI_READY: ready,
-		FAKE_PI_TERMINATED: terminated,
 	});
 
-	const server = startServer();
+	const server = startServer({ streamFn });
 	try {
 		await once(server, "listening");
 		const address = server.address();
@@ -104,23 +92,9 @@ setInterval(() => {}, 1000);
 		const chunks = received.split("\n\n").filter((chunk) => chunk.startsWith("data: "));
 		assert.deepEqual(JSON.parse(chunks[0].slice(6)).choices[0].delta, { role: "assistant" });
 		assert.deepEqual(JSON.parse(chunks[1].slice(6)).choices[0].delta, {});
-		await waitFor(async () => {
-			try {
-				return (await readFile(ready, "utf8")) === "ready";
-			} catch {
-				return false;
-			}
-		});
 		activeResponse.destroy();
 		activeRequest.destroy();
-
-		await waitFor(async () => {
-			try {
-				return (await readFile(terminated, "utf8")) === "SIGTERM";
-			} catch {
-				return false;
-			}
-		});
+		await waitFor(() => aborted);
 	} finally {
 		server.closeAllConnections();
 		server.close();

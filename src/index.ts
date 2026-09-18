@@ -165,6 +165,31 @@ function resolveModel(input: string) {
 	return _resolveModel(MODELS, input);
 }
 
+/** Configure the provider globals for a standalone adapter process. Pi normally
+ * does this during extension registration; the OpenAI server imports the same
+ * state machine directly instead of spawning a nested Pi process. */
+export function configureStandaloneBridge(cwd: string): void {
+	process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
+	const config = loadConfig(cwd);
+	providerSettings = config.provider ?? {};
+	longContextSettings = {
+		plan: providerSettings.plan ?? "pro",
+		longContextExtraUsage: providerSettings.longContextExtraUsage ?? false,
+	};
+}
+
+/** Resolve the complete pi model shape required by streamClaudeAgentSdk. */
+export function standaloneModel(modelId: string): Model<any> | undefined {
+	const model = applyLongContext(MODELS, longContextSettings).find((candidate) => candidate.id === modelId);
+	if (!model) return undefined;
+	return {
+		...model,
+		api: "claude-agent-sdk",
+		provider: PROVIDER_ID,
+		baseUrl: "claude-bridge",
+	};
+}
+
 // --- Error handling ---
 
 function errorMessage(err: unknown): string {
@@ -571,6 +596,8 @@ function reinjectPriorCompactionFileOps(branchEntries: Array<{ type: string; det
 interface SyncResult {
 	sessionId: string | null;
 	preserveSharedSession?: boolean;
+	/** A one-request session imported for the HTTP adapter. Never publish it as shared state. */
+	isolatedSession?: boolean;
 }
 
 /**
@@ -649,6 +676,30 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 //
 // Log strings still say "Case 1/2/3/4" so existing diagnostics (int-cache.sh,
 // int-session-resume.mjs) keep grepping the same anchors.
+function syncIsolatedSession(
+	messages: Context["messages"],
+	cwd: string,
+	customToolNameToSdk?: Map<string, string>,
+	modelId?: string,
+): SyncResult {
+	const priorMessages = messages.slice(0, turnStart(messages));
+	if (priorMessages.length === 0) {
+		debug(`isolated session: clean start, ${messages.length} total messages`);
+		return { sessionId: null, isolatedSession: true };
+	}
+	const session = createSession({
+		projectPath: cwd,
+		claudeDir: process.env.CLAUDE_CONFIG_DIR,
+		...(modelId ? { model: modelId } : {}),
+	});
+	convertAndImportMessages(session, priorMessages, customToolNameToSdk, []);
+	session.save();
+	verifyWrittenSession(session.jsonlPath, session.sessionId, session.records.length, cwd);
+	debugSessionPaths(`isolated-${session.sessionId.slice(0, 8)}`, cwd, session.jsonlPath);
+	debug(`syncResult: path=isolated sessionId=${session.sessionId} priors=${priorMessages.length}`);
+	return { sessionId: session.sessionId, isolatedSession: true };
+}
+
 function syncSharedSession(
 	messages: Context["messages"],
 	cwd: string,
@@ -862,6 +913,18 @@ const promptCaptures = new PromptCaptures(256, (diagnostic) => {
 		) + ` known keys=${diagnostic.matches.length}`,
 	);
 });
+
+/** Register an already-projected caller prompt with the same provenance guard
+ * used by the Pi extension. The HTTP adapter strips Pi's generic harness wrapper
+ * first, so only portable caller/project instructions are appended to Claude Code. */
+export function captureStandalonePrompt(systemPrompt: string): void {
+	if (!systemPrompt) return;
+	promptCaptures.record(systemPrompt, {
+		custom: systemPrompt,
+		contextFiles: [],
+		skills: [],
+	});
+}
 
 /** Whatever a settled session left behind, named in one greppable line.
  *
@@ -1476,7 +1539,7 @@ function drainForAbort(c: QueryContext, promptStream: PromptStream): void {
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
  *  Two cases: tool result delivery (active query) or fresh query. */
-function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
+export function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	showStartupNoticeOnce();
 	const stream = newAssistantMessageEventStream();
 
@@ -1576,7 +1639,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// cliModel is the actual id sent to Claude Code (may carry [1m]); model.id is the
 	// pi-registered id. Log cliModel so debug lines reflect what CC actually received.
 	const cliModel = claudeCodeModelId(model, longContextSettings);
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel);
+	const isolatedSession = options?.metadata?.claudeBridgeIsolatedSession === true;
+	const syncResult = isolatedSession
+		? syncIsolatedSession(context.messages, cwd, customToolNameToSdk, cliModel)
+		: syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel);
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
@@ -1705,8 +1771,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	}
 
 	// Background consumer — runs until query ends
+	let isolatedCapturedSessionId: string | undefined;
 	consumeQuery(sdkQuery, customToolNameToPi, model, () => wasAborted, queryCtx)
 		.then(async ({ capturedSessionId }) => {
+			if (syncResult.isolatedSession) isolatedCapturedSessionId = capturedSessionId;
 			debug(`provider: consumeQuery completed, stopReason=${queryCtx.turnOutput?.stopReason}, error=${queryCtx.turnOutput?.errorMessage}, aborted=${wasAborted}`);
 
 			// --- Abort detection in normal completion path ---
@@ -1726,8 +1794,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 
 			// --- Capture session ID ---
-			const sessionId = capturedSessionId ?? sharedSession?.sessionId;
-			if (syncResult.preserveSharedSession) {
+			const sessionId = capturedSessionId ?? (syncResult.isolatedSession ? syncResult.sessionId : sharedSession?.sessionId);
+			if (syncResult.isolatedSession) {
+				debug(`provider: isolated query done, session=${sessionId?.slice(0, 8) ?? "none"}`);
+			} else if (syncResult.preserveSharedSession) {
 				if (capturedSessionId && capturedSessionId !== sharedSession?.sessionId) {
 					deleteSession(capturedSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 					debug(`provider: query done, deleted ephemeral session ${capturedSessionId.slice(0, 8)} to preserve shared session`);
@@ -1787,6 +1857,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				queryCtx.releasePendingToolCalls("Query ended");
 				queryCtx.activeQuery = null;
 				activeQueryContexts.delete(queryCtx);
+			}
+			if (syncResult.isolatedSession) {
+				const sessionIds = new Set([syncResult.sessionId, isolatedCapturedSessionId].filter((id): id is string => Boolean(id)));
+				for (const sessionId of sessionIds) {
+					deleteSession(sessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+					debug(`provider: deleted isolated session ${sessionId.slice(0, 8)}`);
+				}
 			}
 			sdkQuery.close();
 		});
