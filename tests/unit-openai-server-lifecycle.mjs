@@ -16,6 +16,48 @@ const waitFor = async (check, timeoutMs = 2_000) => {
 	throw new Error("timed out waiting for condition");
 };
 
+const envKeys = [
+	"CLAUDE_BRIDGE_API_KEY",
+	"CLAUDE_BRIDGE_HOST",
+	"CLAUDE_BRIDGE_PORT",
+	"CLAUDE_BRIDGE_CWD",
+	"CLAUDE_BRIDGE_HEARTBEAT_MS",
+	"CLAUDE_BRIDGE_TIMEOUT_MS",
+];
+
+const applyEnv = (overrides) => {
+	const previous = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+	Object.assign(process.env, overrides);
+	return () => {
+		for (const key of envKeys) {
+			if (previous[key] === undefined) delete process.env[key];
+			else process.env[key] = previous[key];
+		}
+	};
+};
+
+const postCompletion = (port, payload) => new Promise((resolve, reject) => {
+	const body = JSON.stringify(payload);
+	const request = httpRequest({
+		host: "127.0.0.1",
+		port,
+		path: "/v1/chat/completions",
+		method: "POST",
+		headers: {
+			authorization: "Bearer test-key",
+			"content-type": "application/json",
+			"content-length": Buffer.byteLength(body),
+		},
+	}, (response) => {
+		let received = "";
+		response.setEncoding("utf8");
+		response.on("data", (chunk) => { received += chunk; });
+		response.on("end", () => resolve({ status: response.statusCode, body: JSON.parse(received) }));
+	});
+	request.on("error", reject);
+	request.end(body);
+});
+
 test("streaming requests emit heartbeats and cancel the Claude query when the client disconnects", async () => {
 	const directory = await mkdtemp(join(tmpdir(), "openai-bridge-lifecycle-"));
 	let aborted = false;
@@ -29,16 +71,7 @@ test("streaming requests emit heartbeats and cancel the Claude query when the cl
 		},
 	});
 
-	const keys = [
-		"CLAUDE_BRIDGE_API_KEY",
-		"CLAUDE_BRIDGE_HOST",
-		"CLAUDE_BRIDGE_PORT",
-		"CLAUDE_BRIDGE_CWD",
-		"CLAUDE_BRIDGE_HEARTBEAT_MS",
-		"CLAUDE_BRIDGE_TIMEOUT_MS",
-	];
-	const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
-	Object.assign(process.env, {
+	const restoreEnv = applyEnv({
 		CLAUDE_BRIDGE_API_KEY: "test-key",
 		CLAUDE_BRIDGE_HOST: "127.0.0.1",
 		CLAUDE_BRIDGE_PORT: "0",
@@ -99,10 +132,69 @@ test("streaming requests emit heartbeats and cancel the Claude query when the cl
 		server.closeAllConnections();
 		server.close();
 		if (server.listening) await once(server, "close");
-		for (const key of keys) {
-			if (previous[key] === undefined) delete process.env[key];
-			else process.env[key] = previous[key];
-		}
+		restoreEnv();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
+
+test("a tool continuation the bridge never issued starts a fresh turn instead of failing the request", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "openai-bridge-continuation-"));
+	let turns = 0;
+	const streamFn = (_model, context) => {
+		turns += 1;
+		return {
+			async *[Symbol.asyncIterator]() {
+				yield {
+					type: "done",
+					message: {
+						role: "assistant",
+						content: [{ type: "text", text: `relayed ${context.messages.length} messages` }],
+						stopReason: "stop",
+					},
+				};
+			},
+		};
+	};
+
+	const restoreEnv = applyEnv({
+		CLAUDE_BRIDGE_API_KEY: "test-key",
+		CLAUDE_BRIDGE_HOST: "127.0.0.1",
+		CLAUDE_BRIDGE_PORT: "0",
+		CLAUDE_BRIDGE_CWD: directory,
+		CLAUDE_BRIDGE_HEARTBEAT_MS: "20",
+		CLAUDE_BRIDGE_TIMEOUT_MS: "5000",
+	});
+
+	const server = startServer({ streamFn });
+	try {
+		await once(server, "listening");
+		const address = server.address();
+		assert.ok(address && typeof address === "object");
+		const response = await postCompletion(address.port, {
+			model: "claude-opus-5",
+			tools: [{
+				type: "function",
+				function: { name: "read", description: "Read a file", parameters: { type: "object", properties: {} } },
+			}],
+			messages: [
+				{ role: "user", content: "go" },
+				{
+					role: "assistant",
+					content: null,
+					tool_calls: [{ id: "call_from_another_provider", type: "function", function: { name: "read", arguments: "{}" } }],
+				},
+				{ role: "tool", tool_call_id: "call_from_another_provider", content: "contents" },
+			],
+		});
+		assert.equal(response.status, 200);
+		assert.equal(response.body.choices[0].message.content, "relayed 3 messages");
+		assert.equal(response.body.choices[0].finish_reason, "stop");
+		assert.equal(turns, 1);
+	} finally {
+		server.closeAllConnections();
+		server.close();
+		if (server.listening) await once(server, "close");
+		restoreEnv();
 		await rm(directory, { recursive: true, force: true });
 	}
 });

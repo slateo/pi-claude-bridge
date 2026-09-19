@@ -278,14 +278,17 @@ export class ContinuationRegistry {
 		lease.timer.unref();
 	}
 
-	resume(model: string, ids: string[]): ContinuationLease {
-		if (ids.length === 0) throw new Error("tool continuation has no result ids");
+	resumeOrCreate(model: string, ids: string[]): ContinuationLease {
+		if (ids.length === 0) return this.create(model);
 		const leases = new Set(ids.map((id) => this.byToolId.get(id)));
-		if (leases.has(undefined) || leases.size !== 1) throw new Error("unknown or mixed Claude relay continuation ids");
-		const lease = [...leases][0]!;
-		if (lease.model !== model) throw new Error("Claude relay continuation model changed");
-		if (ids.length !== lease.expectedIds.size || ids.some((id) => !lease.expectedIds.has(id))) {
-			throw new Error("Claude relay requires all parallel tool results together");
+		const lease = leases.size === 1 ? [...leases][0] : undefined;
+		const resumable = lease
+			&& lease.model === model
+			&& ids.length === lease.expectedIds.size
+			&& ids.every((id) => lease.expectedIds.has(id));
+		if (!resumable) {
+			for (const stale of leases) if (stale) this.finish(stale);
+			return this.create(model);
 		}
 		this.unmap(lease);
 		if (lease.timer) clearTimeout(lease.timer);

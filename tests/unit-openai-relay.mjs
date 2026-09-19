@@ -64,16 +64,36 @@ test("toolResultIds finds all parallel results and ignores completed historical 
 	]), []);
 });
 
-test("continuation leases require one model and all parallel results", () => {
+test("an exact continuation match resumes its own lease", () => {
 	const registry = new ContinuationRegistry(10_000);
 	const lease = registry.create("claude-fable-5-1");
 	registry.bind(lease, ["a", "b"]);
 	assert.equal(registry.size, 1);
-	assert.throws(() => registry.resume("claude-fable-5-1", ["a"]), /all parallel/);
-	assert.throws(() => registry.resume("claude-opus-5", ["a", "b"]), /model changed/);
-	assert.equal(registry.resume("claude-fable-5-1", ["b", "a"]), lease);
+	assert.equal(registry.resumeOrCreate("claude-fable-5-1", ["b", "a"]), lease);
 	assert.equal(registry.size, 0);
 	registry.finish(lease);
+});
+
+test("switching models mid-thread starts a fresh continuation rather than failing the turn", () => {
+	const registry = new ContinuationRegistry(10_000);
+	const lease = registry.create("claude-fable-5-1");
+	registry.bind(lease, ["a", "b"]);
+	const switched = registry.resumeOrCreate("claude-opus-5", ["a", "b"]);
+	assert.notEqual(switched, lease);
+	assert.equal(switched.model, "claude-opus-5");
+	assert.equal(switched.controller.signal.aborted, false);
+	assert.equal(registry.size, 0);
+});
+
+test("unrecognized, partial, and absent continuation ids still yield a usable lease", () => {
+	const registry = new ContinuationRegistry(10_000);
+	const lease = registry.create("claude-opus-5");
+	registry.bind(lease, ["a", "b"]);
+	assert.notEqual(registry.resumeOrCreate("claude-opus-5", ["a"]), lease);
+	assert.equal(registry.size, 0);
+	assert.equal(registry.resumeOrCreate("claude-opus-5", ["toolu_from_another_provider"]).model, "claude-opus-5");
+	assert.equal(registry.resumeOrCreate("claude-opus-5", []).model, "claude-opus-5");
+	assert.equal(registry.size, 0);
 });
 
 test("expired continuation leases abort their Claude query", async () => {

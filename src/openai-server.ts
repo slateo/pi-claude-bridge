@@ -280,9 +280,7 @@ async function handleChat(
 
 	const system = projectPiClientSystemPrompt(rawSystemPrompt(body));
 	const relay = chatRequestToRelay(body, system);
-	const lease: ContinuationLease = relay.resultIds.length > 0
-		? continuations.resume(modelId, relay.resultIds)
-		: continuations.create(modelId);
+	const lease: ContinuationLease = continuations.resumeOrCreate(modelId, relay.resultIds);
 	const id = `chatcmpl-${randomUUID()}`;
 	const created = Math.floor(Date.now() / 1000);
 	const timeoutMs = Number(process.env.CLAUDE_BRIDGE_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
