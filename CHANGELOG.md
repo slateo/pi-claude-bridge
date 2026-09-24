@@ -2,6 +2,8 @@
 
 ## UNRELEASED
 
+- **Add: Claude Opus 5.5 model** — advertise Opus 5.5 through the OpenAI-compatible bridge and map it to Claude Code's 1M-context runtime identifier.
+
 - **Add: authenticated OpenAI-compatible server for private routers** — an opt-in loopback server exposes the bridge model catalog and Chat Completions through the same Claude Agent SDK state machine as the Pi provider.
 - **Fix: OpenAI clients now own tool execution** — the server accepts OpenAI tool definitions, streams Claude `tool_use` blocks as `tool_calls`, keeps the SDK query suspended behind opaque call IDs, and resumes it when the client returns `role: "tool"` results. This removes the nested Pi agent: an outer Pi/T3 session executes every tool exactly once and receives its native start/completion lifecycle events.
 - **Fix: switching models mid-thread no longer kills the thread** — a request whose newest messages are a tool call and its results was rejected with `unknown or mixed Claude relay continuation ids` unless the bridge itself had issued those call ids, so switching to a Claude model after a turn from any other model (or after an interrupted turn dropped the assistant message that carried them) failed every later request, permanently: the history never changes, so every retry carried the same ids. An unrecognized, foreign, or partial continuation now opens a fresh lease and runs the turn from the request's full message list instead of failing it, while recognized ids still resume their own lease and release the results into the parked Claude query.
