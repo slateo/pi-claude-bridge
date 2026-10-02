@@ -2,6 +2,7 @@
 
 ## UNRELEASED
 
+- **Add: Claude Sonnet 5.5 model** — advertise Sonnet 5.5 (derived from Sonnet 5 metadata until pi-ai ships it) and map it to Claude Code's 1M-context runtime identifier.
 - **Add: Claude Opus 5.5 model** — advertise Opus 5.5 through the OpenAI-compatible bridge and map it to Claude Code's 1M-context runtime identifier.
 
 - **Add: authenticated OpenAI-compatible server for private routers** — an opt-in loopback server exposes the bridge model catalog and Chat Completions through the same Claude Agent SDK state machine as the Pi provider.
