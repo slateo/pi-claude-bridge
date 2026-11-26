@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseHarnessUsage, parseUsageResetAt } from "../src/openai-server.ts";
+import { classifyTerminalError, parseHarnessUsage, parseUsageResetAt } from "../src/openai-server.ts";
 
 test("parseUsageResetAt respects the timezone in Claude Code output", () => {
 	assert.equal(
@@ -25,5 +25,31 @@ test("parseHarnessUsage maps Claude Code quota text to Anthropic quota windows",
 			is_active: true,
 			scope: { model: { display_name: "Fable" } },
 		}],
+	});
+});
+
+test("classifyTerminalError maps context overflow and payload limits to 4xx instead of 502", () => {
+	assert.deepEqual(classifyTerminalError("Prompt is too long"), {
+		status: 400,
+		type: "invalid_request_error",
+		code: "context_length_exceeded",
+	});
+	assert.deepEqual(classifyTerminalError("prompt is too long: 1020196 tokens > 1000000 maximum"), {
+		status: 400,
+		type: "invalid_request_error",
+		code: "context_length_exceeded",
+	});
+	assert.deepEqual(classifyTerminalError("request body exceeds limit"), {
+		status: 413,
+		type: "invalid_request_error",
+		code: "request_too_large",
+	});
+	assert.deepEqual(classifyTerminalError("You're out of extra usage"), {
+		status: 429,
+		type: "rate_limit_error",
+	});
+	assert.deepEqual(classifyTerminalError("Claude relay ended without a final message"), {
+		status: 502,
+		type: "server_error",
 	});
 });

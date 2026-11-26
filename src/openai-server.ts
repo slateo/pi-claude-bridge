@@ -260,6 +260,26 @@ function completionChunk(
 	})}\n\n`;
 }
 
+export function classifyTerminalError(message: string): {
+	status: number;
+	type: string;
+	code?: string;
+} {
+	if (/prompt is too long|context[_ -]?length[_ -]?exceeded|maximum context length|input is too long|too many tokens/i.test(message)) {
+		return { status: 400, type: "invalid_request_error", code: "context_length_exceeded" };
+	}
+	if (/request body exceeds limit|payload too large|request entity too large|request too large/i.test(message)) {
+		return { status: 413, type: "invalid_request_error", code: "request_too_large" };
+	}
+	if (/rate[_ -]?limit|too many requests|\b429\b|out of extra usage|usage credits are required/i.test(message)) {
+		return { status: 429, type: "rate_limit_error" };
+	}
+	if (/invalid_request_error|not yet available for this subscription|incompatible with the long context/i.test(message)) {
+		return { status: 400, type: "invalid_request_error" };
+	}
+	return { status: 502, type: "server_error" };
+}
+
 function writeStreamChunk(res: ServerResponse, chunk: string): boolean {
 	if (res.destroyed || res.writableEnded) return false;
 	res.write(chunk);
@@ -360,14 +380,23 @@ async function handleChat(
 	if (terminalError || !finalMessage) {
 		continuations.cancel(lease, terminalError || "Claude relay ended without a final message");
 		const message = terminalError || "Claude relay ended without a final message";
+		const classified = classifyTerminalError(message);
+		const errorBody = {
+			error: {
+				message,
+				type: classified.type,
+				status: classified.status,
+				...(classified.code ? { code: classified.code } : {}),
+			},
+		};
 		if (body.stream) {
-			writeStreamChunk(res, `data: ${JSON.stringify({ error: { message } })}\n\n`);
+			writeStreamChunk(res, `data: ${JSON.stringify(errorBody)}\n\n`);
 			responseEnded = true;
 			res.end("data: [DONE]\n\n");
 			return;
 		}
 		responseEnded = true;
-		return json(res, 502, { error: { message } });
+		return json(res, classified.status, errorBody);
 	}
 
 	const toolCalls = finalMessage.content.filter((block) => block.type === "toolCall");
@@ -448,11 +477,20 @@ export function startServer(options: { streamFn?: typeof streamClaudeAgentSdk } 
 			return json(res, 404, { error: { message: "not found" } });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
+			const status = message.includes("body exceeds") ? 413 : 400;
+			const errorBody = {
+				error: {
+					message,
+					type: "invalid_request_error",
+					status,
+					...(status === 413 ? { code: "request_too_large" } : {}),
+				},
+			};
 			if (res.headersSent) {
-				if (!res.writableEnded) res.end(`data: ${JSON.stringify({ error: { message } })}\n\ndata: [DONE]\n\n`);
+				if (!res.writableEnded) res.end(`data: ${JSON.stringify(errorBody)}\n\ndata: [DONE]\n\n`);
 				return;
 			}
-			return json(res, message.includes("body exceeds") ? 413 : 400, { error: { message } });
+			return json(res, status, errorBody);
 		}
 	});
 	server.listen(port, host, () => console.log(`Claude bridge OpenAI server listening on ${host}:${port}`));

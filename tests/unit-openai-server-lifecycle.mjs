@@ -198,3 +198,97 @@ test("a tool continuation the bridge never issued starts a fresh turn instead of
 		await rm(directory, { recursive: true, force: true });
 	}
 });
+
+test("prompt-too-long terminal errors carry HTTP/SSE status 400 so upstream proxies do not trigger 502 cooldowns", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "openai-bridge-overflow-"));
+	const streamFn = () => ({
+		async *[Symbol.asyncIterator]() {
+			yield {
+				type: "error",
+				reason: "error",
+				error: {
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+					errorMessage: "Prompt is too long",
+				},
+			};
+		},
+	});
+
+	const restoreEnv = applyEnv({
+		CLAUDE_BRIDGE_API_KEY: "test-key",
+		CLAUDE_BRIDGE_HOST: "127.0.0.1",
+		CLAUDE_BRIDGE_PORT: "0",
+		CLAUDE_BRIDGE_CWD: directory,
+		CLAUDE_BRIDGE_HEARTBEAT_MS: "5000",
+		CLAUDE_BRIDGE_TIMEOUT_MS: "5000",
+	});
+
+	const server = startServer({ streamFn });
+	try {
+		await once(server, "listening");
+		const address = server.address();
+		assert.ok(address && typeof address === "object");
+
+		const nonStreaming = await postCompletion(address.port, {
+			model: "claude-opus-5-5",
+			messages: [{ role: "user", content: "too big" }],
+			stream: false,
+		});
+		assert.equal(nonStreaming.status, 400);
+		assert.deepEqual(nonStreaming.body, {
+			error: {
+				message: "Prompt is too long",
+				type: "invalid_request_error",
+				status: 400,
+				code: "context_length_exceeded",
+			},
+		});
+
+		const rawStream = await new Promise((resolve, reject) => {
+			const body = JSON.stringify({
+				model: "claude-opus-5-5",
+				messages: [{ role: "user", content: "too big" }],
+				stream: true,
+			});
+			const req = httpRequest({
+				host: "127.0.0.1",
+				port: address.port,
+				path: "/v1/chat/completions",
+				method: "POST",
+				headers: {
+					authorization: "Bearer test-key",
+					"content-type": "application/json",
+					"content-length": Buffer.byteLength(body),
+				},
+			}, (res) => {
+				let received = "";
+				res.setEncoding("utf8");
+				res.on("data", (chunk) => { received += chunk; });
+				res.on("end", () => resolve(received));
+			});
+			req.on("error", reject);
+			req.end(body);
+		});
+		const errorChunk = rawStream
+			.split("\n\n")
+			.filter((chunk) => chunk.startsWith("data: ") && chunk !== "data: [DONE]")
+			.map((chunk) => JSON.parse(chunk.slice(6)))
+			.find((payload) => payload.error);
+		assert.deepEqual(errorChunk, {
+			error: {
+				message: "Prompt is too long",
+				type: "invalid_request_error",
+				status: 400,
+				code: "context_length_exceeded",
+			},
+		});
+	} finally {
+		server.closeAllConnections();
+		server.close();
+		if (server.listening) await once(server, "close");
+		restoreEnv();
+		await rm(directory, { recursive: true, force: true });
+	}
+});
